@@ -1,0 +1,409 @@
+desc:Summit Exchange
+options:gmem=SummitPatchSender
+filename:0,summit_exchange_header.png
+in_pin:none
+out_pin:none
+
+// Copyright 2026 Roman Altenburg (Digby)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for the license text.
+
+@init
+ext_noinit = 1;
+ext_nodenorm = 1;
+
+function valid_snapshot(buffer, length) local(index, valid, command) (
+    command = buffer[8];
+    valid = ((length == 527 && command == 0) || (length == 1039 && command == 2))
+        && buffer[0] == $xF0 && buffer[1] == 0 && buffer[2] == $x20
+        && buffer[3] == $x29 && buffer[4] == 1 && buffer[5] == $x11
+        && buffer[6] == 1 && buffer[7] == $x33 && buffer[length - 1] == $xF7;
+    index = 9;
+    while (valid && index < length - 1) (
+        valid = buffer[index] >= 0 && buffer[index] < 128
+            && buffer[index] == floor(buffer[index]) && (index >= 16 || buffer[index] == 0);
+        index += 1;
+    );
+    valid;
+);
+
+function valid_settings(buffer, length) local(index, valid) (
+    valid = length == 527 && buffer[0] == $xF0 && buffer[1] == 0
+        && buffer[2] == $x20 && buffer[3] == $x29 && buffer[4] == 1
+        && buffer[5] == $x11 && buffer[6] == 1 && buffer[7] == $x33
+        && buffer[8] == 4 && buffer[length - 1] == $xF7
+        && buffer[31] >= 0 && buffer[31] <= 15
+        && buffer[57] >= 0 && buffer[57] <= 15
+        && buffer[58] >= 0 && buffer[58] <= 15;
+    index = 9;
+    while (valid && index < length - 1) (
+        valid = buffer[index] >= 0 && buffer[index] < 128
+            && buffer[index] == floor(buffer[index]);
+        index += 1;
+    );
+    valid;
+);
+
+function decode_snapshot() local(index, offset, character) (
+    snapshot_mode = snapshot_length == 1039;
+    snapshot_subtype = snapshot_mode ? snapshot_buffer[429] : -1;
+    offset = snapshot_mode ? 411 : 16;
+    patch_name_length = 16;
+    index = 0;
+    loop(16,
+        character = snapshot_buffer[offset + index];
+        patch_name_buffer[index] = character >= 32 && character <= 126 ? character : 32;
+        index += 1;
+    );
+    while (patch_name_length > 0 && patch_name_buffer[patch_name_length - 1] == 32) (
+        patch_name_length -= 1;
+    );
+);
+
+function accept_snapshot(buffer, length) (
+    memcpy(snapshot_buffer, buffer, length);
+    snapshot_length = length;
+    decode_snapshot();
+);
+
+function request_patch() (
+    assembly_active = 0;
+    assembly_length = 0;
+    request_buffer[8] = grab_mode ? $x42 : $x40;
+    sent_length = midisend_buf(0, request_buffer, 15);
+    requested_mode = grab_mode;
+    grab_state = sent_length == 15 ? 1 : 4;
+    reply_deadline = time_precise() + 5;
+);
+
+function receive_mode_cc(status, controller, value) local(channel) (
+    channel = status & 15;
+    mode_nrpn_stage > 0 && time_precise() > mode_nrpn_deadline ? mode_nrpn_stage = 0;
+    controller == $x3E && value <= 1 ? (
+        grab_mode = value == 0 ? 1 : 0;
+        mode_nrpn_stage = 0;
+    ) : controller == $x63 && value == $x3E ? (
+        mode_nrpn_stage = 1;
+        mode_nrpn_channel = channel;
+        mode_nrpn_deadline = time_precise() + 0.5;
+    ) : mode_nrpn_stage == 1 ? (
+        channel == mode_nrpn_channel && controller == $x62 && value == 0
+            ? mode_nrpn_stage = 2 : mode_nrpn_stage = 0;
+    ) : mode_nrpn_stage == 2 ? (
+        channel == mode_nrpn_channel && controller == $x06 && value <= 1 ? (
+            grab_mode = value;
+            mode_nrpn_stage = 0;
+        ) : mode_nrpn_stage = 0;
+    );
+);
+
+function receive_byte(value) (
+    value == $xF0 ? (
+        assembly_active = 1;
+        assembly_length = 1;
+        assembly_buffer[0] = value;
+    ) : assembly_active && value < $xF8 ? (
+        (value < 128 || value == $xF7) && assembly_length < 1039 ? (
+            assembly_buffer[assembly_length] = value;
+            assembly_length += 1;
+            value == $xF7 ? (
+                assembly_active = 0;
+                completed_count += 1;
+                last_complete_length = assembly_length;
+                identity_reply = assembly_length == 17 && assembly_buffer[1] == $x7E
+                    && assembly_buffer[3] == 6 && assembly_buffer[4] == 2
+                    && assembly_buffer[5] == 0 && assembly_buffer[6] == $x20
+                    && assembly_buffer[7] == $x29 && assembly_buffer[8] == $x33
+                    && assembly_buffer[9] == 1 && assembly_buffer[10] == 0
+                    && assembly_buffer[11] == 0;
+                identity_reply ? connection_state = 2;
+                valid_settings(assembly_buffer, assembly_length) ? (
+                    global_channel = assembly_buffer[31] + 1;
+                    part_a_channel = assembly_buffer[57] + 1;
+                    part_b_channel = assembly_buffer[58] + 1;
+                    settings_known = 1;
+                    connection_state = 2;
+                );
+                valid_snapshot(assembly_buffer, assembly_length) ? (
+                    connection_state = 2;
+                    grab_state == 1 && (assembly_length == 1039) == requested_mode ? (
+                        accept_snapshot(assembly_buffer, assembly_length);
+                        grab_state = 2;
+                    );
+                );
+            );
+        ) : (
+            assembly_active = 0;
+            assembly_length = 0;
+        );
+    );
+);
+
+receive_buffer = 0;
+assembly_buffer = 65552;
+snapshot_buffer = 71000;
+staging_buffer = 76000;
+patch_name_buffer = 78000;
+request_buffer = 79000;
+mem_set_values(request_buffer, $xF0, 0, $x20, $x29, 1, $x11, 1, $x33, $x40, 0, 0, 0, 0, 0, $xF7);
+settings_request_buffer = 79100;
+mem_set_values(settings_request_buffer, $xF0, 0, $x20, $x29, 1, $x11, 1, $x33, $x44, 0, 0, 0, 0, 0, $xF7);
+settings_known = 0;
+mode_nrpn_stage = 0;
+snapshot_length == 527 || snapshot_length == 1039 ? decode_snapshot() : (
+    snapshot_length = 0;
+    patch_name_length = 0;
+);
+grab_mode = grab_mode == 1 ? 1 : 0;
+grab_state = snapshot_length > 0 ? 5 : 0;
+grab_requested = 0;
+mode_requested = 0;
+action_requested = 0;
+action_state = 0;
+active_operation = 0;
+sender_id = atomic_add(gmem[1], 1);
+connection_state = 0;
+startup_samples = 0;
+event_count = 0;
+completed_count = 0;
+last_complete_length = 0;
+assembly_active = 0;
+assembly_length = 0;
+mouse_was_down = 0;
+
+@block
+while ((received_length = midirecv_buf(event_offset, receive_buffer, 65536)) > 0) (
+    event_count += 1;
+    first_byte = receive_buffer[0];
+    received_length == 3 && (first_byte & $xF0) == $xB0
+        ? receive_mode_cc(first_byte, receive_buffer[1], receive_buffer[2]);
+    scan_index = 0;
+    loop(received_length,
+        receive_byte(receive_buffer[scan_index]);
+        scan_index += 1;
+    );
+    first_byte != $xF0 && first_byte >= 128 && first_byte != $xF7
+        ? midisend_buf(event_offset, receive_buffer, received_length);
+);
+
+connection_state == 0 ? (
+    startup_samples += samplesblock;
+    startup_samples >= srate * 0.5 ? (
+        sent_length = midisend_str(0, "\xF0\x7E\x7F\x06\x01\xF7");
+        connection_state = sent_length == 6 ? 1 : 4;
+        settings_sent_length = midisend_buf(0, settings_request_buffer, 15);
+        identity_deadline = time_precise() + 5;
+    );
+);
+connection_state == 1 && time_precise() >= identity_deadline ? connection_state = 3;
+mode_requested ? (
+    requested_selection = mode_requested;
+    mode_requested = 0;
+    grab_state != 1 && action_state != 3 ? (
+        mode_channel = requested_selection == 1 ? $xB1 : $xB0;
+        midisend(0, mode_channel, $x63, $x3E);
+        midisend(0, mode_channel, $x62, 0);
+        midisend(0, mode_channel, $x06, requested_selection - 1);
+        grab_mode = requested_selection - 1;
+    );
+);
+grab_requested ? (
+    grab_requested = 0;
+    grab_state != 1 && action_state != 3 ? request_patch();
+);
+grab_state == 1 && time_precise() >= reply_deadline ? grab_state = 3;
+
+action_requested ? (
+    requested_operation = action_requested;
+    action_requested = 0;
+    grab_state != 1 && action_state != 3
+        && (requested_operation == 3 || snapshot_length > 0) ? (
+        active_operation = requested_operation;
+        gmem[3] > 0 && abs(time_precise() - gmem[3]) < 2 ? (
+            atomic_setifequal(gmem[0], 0, 1) == 0 ? (
+                gmem[2] = sender_id;
+                gmem[5] = time_precise();
+                gmem[6] = active_operation;
+                gmem[7] = snapshot_length;
+                active_operation != 3 ? (
+                    copy_index = 0;
+                    loop(snapshot_length,
+                        gmem[16 + copy_index] = snapshot_buffer[copy_index];
+                        copy_index += 1;
+                    );
+                );
+                action_state = 3;
+                atomic_set(gmem[0], 2);
+            ) : action_state = 5;
+        ) : action_state = 5;
+    );
+);
+action_state == 3 && gmem[2] == sender_id ? (
+    bridge_state = atomic_get(gmem[0]);
+    bridge_state == 4 || bridge_state == 5 || bridge_state == 6 ? (
+        action_state = bridge_state == 4 ? 1 : bridge_state == 6 ? 4 : 2;
+        active_operation == 3 && action_state == 1 ? (
+            loaded_length = gmem[7];
+            loaded_length == 527 || loaded_length == 1039 ? (
+                copy_index = 0;
+                loop(loaded_length,
+                    staging_buffer[copy_index] = gmem[16 + copy_index];
+                    copy_index += 1;
+                );
+                valid_snapshot(staging_buffer, loaded_length) ? (
+                    accept_snapshot(staging_buffer, loaded_length);
+                    grab_state = 6;
+                ) : action_state = 2;
+            ) : action_state = 2;
+        );
+        atomic_setifequal(gmem[0], bridge_state, 0);
+    );
+);
+
+@serialize
+file_avail(0) >= 0 ? (
+    stored_version = 0;
+    stored_length = 0;
+    snapshot_length = 0;
+    patch_name_length = 0;
+    grab_state = 0;
+    grab_requested = 0;
+    mode_requested = 0;
+    action_requested = 0;
+    action_state = 0;
+    file_var(0, stored_version);
+    file_var(0, stored_length);
+    stored_version == 1 && (stored_length == 527 || stored_length == 1039) ? (
+        restored_length = file_mem(0, 76000, stored_length);
+        restored_length == stored_length && valid_snapshot(76000, stored_length) ? (
+            accept_snapshot(76000, stored_length);
+            grab_state = 5;
+        );
+    );
+) : (
+    stored_version = 1;
+    file_var(0, stored_version);
+    file_var(0, snapshot_length);
+    snapshot_length > 0 ? file_mem(0, snapshot_buffer, snapshot_length);
+);
+
+@gfx 619 396
+function set_color(color) (
+    gfx_set(((color >> 16) & 255) / 255, ((color >> 8) & 255) / 255, (color & 255) / 255, 1);
+);
+
+function draw_button(left, label, active_color, enabled, disabled_color) local(width, height) (
+    set_color(enabled ? active_color : disabled_color);
+    gfx_rect(left, 172, 140, 38);
+    enabled ? gfx_set(0.95, 0.95, 0.95, 1) : gfx_set(0.55, 0.55, 0.55, 1);
+    gfx_measurestr(label, width, height);
+    gfx_x = left + (140 - width) / 2;
+    gfx_y = 172 + (38 - height) / 2;
+    gfx_drawstr(label);
+);
+
+gfx_clear = $x202020;
+gfx_set(1, 1, 1, 1);
+gfx_x = 0;
+gfx_y = 0;
+gfx_blit(0, 1, 0, 0, 0, 619, 100, 0, 0, 619, 100);
+gfx_setfont(1, "DejaVu Sans", 14);
+gfx_x = 16;
+gfx_y = 110;
+connection_state == 2 ? (gfx_set(0.4, 0.85, 0.5, 1); gfx_drawstr("Online"))
+    : connection_state == 3 ? (gfx_set(0.95, 0.7, 0.35, 1); gfx_drawstr("No identity reply"))
+    : connection_state == 4 ? gfx_drawstr("Request could not be sent") : gfx_drawstr("Checking...");
+gfx_set(0.65, 0.65, 0.65, 1);
+gfx_measurestr("v1.0", version_width, version_height);
+gfx_x = 605 - version_width;
+gfx_y = 110;
+gfx_drawstr("v1.0");
+gfx_set(0.9, 0.9, 0.9, 1);
+gfx_setfont(1, "DejaVu Sans", 20);
+gfx_x = 16;
+gfx_y = 139;
+gfx_drawstr("Patch name: ");
+display_index = 0;
+loop(patch_name_length,
+    gfx_printf("%c", patch_name_buffer[display_index]);
+    display_index += 1;
+);
+sender_online = gmem[3] > 0 && abs(time_precise() - gmem[3]) < 2;
+idle = grab_state != 1 && action_state != 3 && !grab_requested && !action_requested && !mode_requested;
+send_enabled = idle && sender_online && snapshot_length > 0;
+load_enabled = idle && sender_online;
+grab_enabled = idle;
+mode_color = grab_mode ? $x498DC7 : $xCC6208;
+set_color(mode_color);
+gfx_rect(465, 135, 140, 24);
+gfx_set(0.95, 0.95, 0.95, 1);
+gfx_setfont(1, "DejaVu Sans", 14);
+gfx_x = 465;
+gfx_y = 135;
+grab_mode ? gfx_drawstr("Multi Mode  v", 5, 605, 159) : gfx_drawstr("Single Mode  v", 5, 605, 159);
+gfx_setfont(1, "DejaVu Sans", 16);
+draw_button(15, "Send Patch", mode_color, send_enabled, grab_mode ? $x3A4A58 : $x59402A);
+draw_button(165, "Grab Patch", mode_color, grab_enabled, grab_mode ? $x3A4853 : $x533D2B);
+draw_button(315, "Load from Disk", mode_color, load_enabled, grab_mode ? $x3A454E : $x4C3B2C);
+draw_button(465, "Save to Disk", mode_color, send_enabled, grab_mode ? $x3A424A : $x4C3B2C);
+mouse_down = mouse_cap & 1;
+mouse_down && !mouse_was_down && idle ? (
+    mouse_y >= 172 && mouse_y < 210 ? (
+        mouse_x >= 15 && mouse_x < 155 && send_enabled ? action_requested = 1;
+        mouse_x >= 165 && mouse_x < 305 ? grab_requested = 1;
+        mouse_x >= 315 && mouse_x < 455 && load_enabled ? action_requested = 3;
+        mouse_x >= 465 && mouse_x < 605 && send_enabled ? action_requested = 2;
+    );
+    mouse_x >= 465 && mouse_x < 605 && mouse_y >= 135 && mouse_y < 159 ? (
+        gfx_x = 465;
+        gfx_y = 159;
+        selected_mode = grab_mode ? gfx_showmenu("Single|!Multi") : gfx_showmenu("!Single|Multi");
+        selected_mode > 0 ? mode_requested = selected_mode;
+    );
+);
+mouse_was_down = mouse_down;
+gfx_set(0.9, 0.9, 0.9, 1);
+gfx_setfont(1, "DejaVu Sans", 14);
+gfx_x = 16;
+gfx_y = 228;
+grab_state > 0 && grab_state != 2 ? (
+    grab_state == 1 ? gfx_drawstr("Grabbing...")
+        : grab_state == 3 ? gfx_drawstr("Grab failed: no complete matching reply")
+        : grab_state == 4 ? gfx_drawstr("Grab failed: request could not be sent")
+        : grab_state == 5 ? gfx_drawstr("Patch loaded from project")
+    : gfx_drawstr("Patch loaded from disk; not sent");
+);
+gfx_x = 16;
+gfx_y = 253;
+snapshot_length > 0 ? (
+    gfx_drawstr("Snapshot mode: ");
+    snapshot_mode ? (
+        gfx_drawstr("Multi - ");
+        snapshot_subtype == 0 ? gfx_drawstr("Layer")
+            : snapshot_subtype == 1 ? gfx_drawstr("Split")
+            : snapshot_subtype == 2 ? gfx_drawstr("Dual") : gfx_drawstr("Unrecognized subtype");
+    ) : gfx_drawstr("Single");
+);
+gfx_x = 16;
+gfx_y = 280;
+settings_known ? gfx_printf("MIDI channels: Global %d   Part A %d   Part B %d", global_channel, part_a_channel, part_b_channel)
+    : gfx_drawstr("MIDI channels: querying...");
+gfx_x = 16;
+gfx_y = 308;
+gfx_printf("Snapshot: %d bytes", snapshot_length);
+gfx_x = 16;
+gfx_y = 332;
+action_state == 3 ? gfx_drawstr("Working...")
+    : action_state == 2 ? gfx_drawstr("Operation failed; check the helper console")
+    : action_state == 4 ? gfx_drawstr("Cancelled")
+    : action_state == 5 ? gfx_drawstr("Helper unavailable or busy")
+    : action_state == 1 ? (
+        active_operation == 1 ? gfx_drawstr("Patch sent to MIDI output")
+            : active_operation == 2 ? gfx_drawstr("Saved .syx to disk") : gfx_drawstr("Loaded from disk; not sent");
+    ) : !sender_online ? gfx_drawstr("Start Exchange Helper");
+gfx_x = 16;
+gfx_y = 356;
+snapshot_length > 0 ? (
+    snapshot_mode ? gfx_drawstr("Send requires Multi mode selected on Summit")
+        : gfx_drawstr("Send requires Single mode selected on Summit");
+);

@@ -1,0 +1,6 @@
+*.cpp text eol=lf
+*.jsfx text eol=lf
+*.lua text eol=lf
+*.md text eol=lf
+*.png binary
+*.psd binary

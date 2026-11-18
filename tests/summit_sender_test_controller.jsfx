@@ -1,0 +1,32 @@
+desc:Summit mailbox test controller
+options:gmem=SummitPatchSender
+in_pin:none
+out_pin:none
+
+// Copyright 2026 Roman Altenburg (Digby)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for the license text.
+
+@block
+heartbeat ? gmem[3] = time_precise();
+write_state ? (
+    gmem[0] = desired_state;
+    write_state = 0;
+);
+while ((length = midirecv_buf(offset, 0, 2048)) > 0) (
+    copy_index = 0;
+    loop(length,
+        gmem[16 + copy_index] = copy_index[0];
+        copy_index += 1;
+    );
+    gmem[7] = length;
+    gmem[0] = 4;
+);
+observed_state = gmem[0];
+observed_operation = gmem[6];
+observed_length = gmem[7];
+copy_index = 0;
+loop(1039,
+    copy_index[0] = gmem[16 + copy_index];
+    copy_index += 1;
+);
